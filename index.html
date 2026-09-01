@@ -1697,6 +1697,7 @@ function bindPreviews(){
       stopPreview();
       const id=el.dataset.prev;
       const it=DB.videos.find(v=>v.id===id); if(!it) return;
+      if(premPhase(it)==='countdown') return;
       PREVIEW={ el, delay:setTimeout(()=>startPreview(el,it),0) };
     };
     el.onmouseleave=stopPreview;
