@@ -393,6 +393,307 @@ const DB_VERSION=3;
 const APP_VERSION='1.1.0.0';
 
 /* ==================================================================
+   ОБЛАКО: SUPABASE
+   Общая база для всех посетителей сайта. Работает по принципу
+   «зеркало + синхронизация»: в памяти живёт тот же объект DB, что и
+   раньше, поэтому весь остальной код не меняется. Облако лишь
+   наполняет DB при запуске, забирает правки и раздаёт их другим
+   вкладкам и другим людям.
+
+   ЧТО НУЖНО ЗАПОЛНИТЬ: две строки ниже — URL и публичный ключ
+   проекта. Оба значения берутся в панели Supabase:
+   Project Settings → API → Project URL и anon public.
+   Пока они пустые, сайт работает как раньше — только локально.
+   ================================================================== */
+const CLOUD={
+  URL:  '',            /* ← сюда Project URL,  вида https://xxxx.supabase.co */
+  KEY:  '',            /* ← сюда anon public key */
+
+  BUCKET:'media',            // корзина хранилища для видео, обложек, аватаров
+  MAIL:'orbit.local',        // логин превращается в адрес: имя@orbit.local
+  client:null, on:false, ready:false,
+  snap:{},                   // слепок последней отправки: что уже лежит в облаке
+  pushT:null, pullT:null, chan:null, busy:false
+};
+CLOUD.on = !!(CLOUD.URL && CLOUD.KEY);
+
+/* Экран загрузки, пока приходит первая порция данных */
+function cloudSplash(text){
+  const r=$('#root'); if(!r) return;
+  r.innerHTML='<div style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px">'+
+    '<span class="spinner" style="width:26px;height:26px"></span>'+
+    '<div style="color:var(--muted);font-size:14px">'+esc(text||'')+'</div></div>';
+}
+function cloudErr(text,detail){
+  const r=$('#root'); if(!r) return;
+  r.innerHTML='<div style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;text-align:center">'+
+    '<div style="font-size:17px;font-weight:700">'+esc(text)+'</div>'+
+    (detail?'<div style="color:var(--muted);font-size:13.5px;max-width:460px;line-height:1.6">'+esc(detail)+'</div>':'')+
+    '<button class="btn" onclick="location.reload()">'+esc(LANG==='ru'?'Обновить страницу':'Reload')+'</button></div>';
+}
+
+/* Подключение библиотеки Supabase с CDN */
+function cloudLoadSDK(){
+  return new Promise((res,rej)=>{
+    if(window.supabase&&window.supabase.createClient) return res();
+    const s=document.createElement('script');
+    s.src='https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js';
+    s.onload=()=>res();
+    s.onerror=()=>rej(new Error('sdk'));
+    document.head.appendChild(s);
+  });
+}
+
+/* ------------------------------------------------------------------
+   ЧТЕНИЕ: облако → DB
+   ------------------------------------------------------------------ */
+async function cloudFetchAll(tbl,cols){
+  // Забираем таблицу постранично, чтобы не упереться в лимит строк
+  const out=[]; const STEP=1000;
+  for(let from=0;;from+=STEP){
+    const {data,error}=await CLOUD.client.from(tbl).select(cols||'*').range(from,from+STEP-1);
+    if(error) throw error;
+    out.push.apply(out,data||[]);
+    if(!data||data.length<STEP) break;
+  }
+  return out;
+}
+async function cloudPull(){
+  const [pr,ct,cm,tk,lg,rs,vw,fl,pc]=await Promise.all([
+    cloudFetchAll('profiles'), cloudFetchAll('content'), cloudFetchAll('comments'),
+    cloudFetchAll('tickets'),  cloudFetchAll('logs'),    cloudFetchAll('restrictions'),
+    cloudFetchAll('views'),    cloudFetchAll('follows'), cloudFetchAll('premchat')
+  ]);
+  const users=pr.map(r=>{
+    const u=Object.assign({},r.data||{});
+    u.authId=r.id; u.username=r.username;
+    ['following','bookmarks','notifications'].forEach(k=>{ if(!Array.isArray(u[k])) u[k]=[]; });
+    if(typeof u.banned!=='boolean') u.banned=false;
+    if(typeof u.bannedUntil!=='number') u.bannedUntil=0;
+    if(!u.color) u.color='#e5e5e5';
+    if(!REGIONS.includes(u.region)) u.region='EU';
+    if(!u.id) u.id=r.id;
+    return u;
+  });
+  DB={
+    version:DB_VERSION, createdAt:DB.createdAt||Date.now(),
+    users,
+    videos: ct.filter(r=>r.kind==='video').map(r=>r.data).filter(Boolean),
+    posts:  ct.filter(r=>r.kind==='post').map(r=>r.data).filter(Boolean),
+    comments: cm.map(r=>r.data).filter(Boolean),
+    tickets:  tk.map(r=>r.data).filter(Boolean),
+    logs:     lg.map(r=>r.data).filter(Boolean),
+    restrictions: rs.map(r=>r.data).filter(Boolean),
+    views:    vw.map(r=>({item:r.item,who:r.who,at:Number(r.at)||0})),
+    follows:  fl.map(r=>({from:r.from_user,to:r.to_user,at:Number(r.at)||0})),
+    premchat: pc.map(r=>r.data).filter(Boolean),
+    bans:[]
+  };
+  // подчищаем то, что могло прийти без обязательных полей
+  DB.videos.forEach(v=>{ if(!Array.isArray(v.tags)) v.tags=[]; if(!v.category) v.category='none';
+    ['likes','dislikes'].forEach(k=>{ if(!Array.isArray(v[k])) v[k]=[]; }); });
+  DB.posts.forEach(p=>{ ['likes','dislikes'].forEach(k=>{ if(!Array.isArray(p[k])) p[k]=[]; }); });
+  cloudSnap();                       // запомнили состояние — с ним будем сравнивать
+  try{ localStorage.setItem(LS.DB,JSON.stringify(DB)); }catch(e){}
+}
+
+/* ------------------------------------------------------------------
+   ЗАПИСЬ: DB → облако. Отправляем только изменившиеся строки.
+   ------------------------------------------------------------------ */
+function cloudRows(){
+  const rows=[];
+  const add=(tbl,key,row,pk)=>rows.push({tbl,key:tbl+':'+key,row,pk});
+  DB.videos.forEach(v=>add('content',v.id,{id:v.id,kind:'video',author:v.author,slug:v.slug||'',data:v}));
+  DB.posts .forEach(p=>add('content',p.id,{id:p.id,kind:'post', author:p.author,slug:p.slug||'',data:p}));
+  DB.comments.forEach(c=>add('comments',c.id,{id:c.id,target_id:c.targetId,author:c.author,data:c}));
+  DB.tickets .forEach(x=>add('tickets', x.id,{id:x.id,owner:x.user,data:x}));
+  DB.logs    .forEach(x=>add('logs',    x.id,{id:x.id,data:x}));
+  DB.restrictions.forEach(x=>add('restrictions',x.id,{id:x.id,data:x}));
+  DB.premchat.forEach(x=>add('premchat',x.id,{id:x.id,item:x.item,author:x.user,data:x}));
+  DB.views  .forEach(x=>add('views',  x.item+'|'+x.who,{item:x.item,who:x.who,at:x.at},['item','who']));
+  DB.follows.forEach(x=>add('follows',x.from+'|'+x.to,{from_user:x.from,to_user:x.to,at:x.at},['from_user','to_user']));
+  DB.users.forEach(u=>{
+    if(!u.authId) return;                       // профиль без учётной записи в облако не идёт
+    const d=Object.assign({},u); delete d.password;   // пароль в базе профилей не хранится
+    add('profiles',u.authId,{id:u.authId,username:u.username,data:d});
+  });
+  return rows;
+}
+function cloudSnap(){
+  const m={};
+  cloudRows().forEach(r=>{ m[r.key]=JSON.stringify(r.row); });
+  CLOUD.snap=m;
+}
+/* Гость базу не меняет: он только читает. Поэтому его правки —
+   например засчитанный просмотр — остаются в его же браузере. */
+const cloudCanWrite=()=>CLOUD.on&&CLOUD.ready&&!!(SESSION&&SESSION.authId);
+function cloudPush(){
+  if(!cloudCanWrite()) return;
+  clearTimeout(CLOUD.pushT);
+  CLOUD.pushT=setTimeout(cloudPushNow,400);      // склеиваем частые правки в одну отправку
+}
+async function cloudPushNow(){
+  if(!cloudCanWrite()||CLOUD.busy) return;
+  CLOUD.busy=true;
+  try{
+    const rows=cloudRows();
+    const seen={}, byTbl={};
+    rows.forEach(r=>{
+      seen[r.key]=1;
+      const s=JSON.stringify(r.row);
+      if(CLOUD.snap[r.key]===s) return;          // не изменилось — не трогаем
+      (byTbl[r.tbl]=byTbl[r.tbl]||[]).push(r.row);
+      CLOUD.snap[r.key]=s;
+    });
+    // то, что исчезло из DB, удаляем и в облаке
+    const gone={};
+    Object.keys(CLOUD.snap).forEach(k=>{ if(!seen[k]){
+      const i=k.indexOf(':'); (gone[k.slice(0,i)]=gone[k.slice(0,i)]||[]).push(k.slice(i+1));
+      delete CLOUD.snap[k]; } });
+
+    for(const tbl of Object.keys(byTbl)){
+      const opt = tbl==='views'? {onConflict:'item,who'} : tbl==='follows'? {onConflict:'from_user,to_user'} : undefined;
+      const {error}=await CLOUD.client.from(tbl).upsert(byTbl[tbl],opt);
+      if(error) console.warn('[cloud] upsert '+tbl,error.message);
+    }
+    for(const tbl of Object.keys(gone)){
+      for(const key of gone[tbl]){
+        let q=CLOUD.client.from(tbl).delete();
+        if(tbl==='views'){ const p=key.split('|'); q=q.eq('item',p[0]).eq('who',p.slice(1).join('|')); }
+        else if(tbl==='follows'){ const p=key.split('|'); q=q.eq('from_user',p[0]).eq('to_user',p.slice(1).join('|')); }
+        else q=q.eq('id',key);
+        const {error}=await q;
+        if(error) console.warn('[cloud] delete '+tbl,error.message);
+      }
+    }
+  }catch(e){ console.warn('[cloud] push',e); }
+  CLOUD.busy=false;
+}
+
+/* ------------------------------------------------------------------
+   ЖИВЫЕ ОБНОВЛЕНИЯ: чужие правки приходят сами
+   ------------------------------------------------------------------ */
+function cloudWatch(){
+  if(!CLOUD.on||CLOUD.chan) return;
+  CLOUD.chan=CLOUD.client.channel('orbit-all');
+  ['profiles','content','comments','tickets','logs','restrictions','views','follows','premchat']
+    .forEach(tbl=>CLOUD.chan.on('postgres_changes',{event:'*',schema:'public',table:tbl},()=>cloudSoftPull()));
+  CLOUD.chan.subscribe();
+}
+function cloudSoftPull(){
+  clearTimeout(CLOUD.pullT);
+  CLOUD.pullT=setTimeout(async()=>{
+    if(CLOUD.busy) return cloudSoftPull();          // не мешаем своей же отправке
+    // Пока открыта модалка или идёт премьера — не дёргаем перерисовку
+    try{ await cloudPull(); }catch(e){ return; }
+    if($('#modals').innerHTML) return;
+    if(PL.playing&&ROUTE.name==='watch') return;    // не сбиваем воспроизведение
+    render();
+  },600);
+}
+
+/* ------------------------------------------------------------------
+   ВХОД И РЕГИСТРАЦИЯ ЧЕРЕЗ SUPABASE AUTH
+   Логин пользователя превращается в служебный адрес имя@orbit.local —
+   так привычная форма входа остаётся неизменной.
+   ------------------------------------------------------------------ */
+const cloudMail=lg=>String(lg).trim().toLowerCase()+'@'+CLOUD.MAIL;
+
+async function cloudSignIn(login,pass){
+  const {data,error}=await CLOUD.client.auth.signInWithPassword({email:cloudMail(login),password:pass});
+  if(error) return {ok:false,why:error.message};
+  return {ok:true,user:data.user};
+}
+async function cloudSignUp(login,pass,profile){
+  const {data,error}=await CLOUD.client.auth.signUp({email:cloudMail(login),password:pass});
+  if(error) return {ok:false,why:error.message};
+  const id=data.user&&data.user.id;
+  if(!id) return {ok:false,why:'no-user'};
+  // Без действующей сессии профиль создать не выйдет: так бывает, когда в
+  // настройках проекта осталось включённым подтверждение адреса. Письмо на
+  // служебный адрес вида имя@orbit.local доставить некуда, поэтому
+  // подтверждение нужно выключить: Authentication → Sign In / Providers →
+  // Email → Confirm email.
+  if(!data.session) return {ok:false,why: LANG==='ru'
+    ? 'Регистрация не завершена: в проекте Supabase включено подтверждение адреса. Отключите Confirm email в разделе Authentication.'
+    : 'Sign-up incomplete: email confirmation is enabled in the Supabase project. Turn off Confirm email under Authentication.'};
+  const row={id,username:login,data:Object.assign({},profile,{authId:id,username:login})};
+  const {error:e2}=await CLOUD.client.from('profiles').insert(row);
+  if(e2) return {ok:false,why:e2.message};
+  return {ok:true,id};
+}
+async function cloudSignOut(){
+  try{ await CLOUD.client.auth.signOut(); }catch(e){}
+  if(CLOUD.chan){ try{ CLOUD.client.removeChannel(CLOUD.chan); }catch(e){} CLOUD.chan=null; }
+}
+/* Текущая учётная запись Supabase → SESSION приложения */
+async function cloudSyncSession(){
+  const {data}=await CLOUD.client.auth.getSession();
+  const s=data&&data.session;
+  if(!s){ SESSION=null; localStorage.removeItem(LS.SESSION); return null; }
+  const prof=DB.users.find(u=>u.authId===s.user.id);
+  if(!prof){ SESSION=null; localStorage.removeItem(LS.SESSION); return null; }
+  SESSION={username:prof.username,at:Date.now(),authId:s.user.id};
+  try{ localStorage.setItem(LS.SESSION,JSON.stringify(SESSION)); }catch(e){}
+  return SESSION;
+}
+
+/* ------------------------------------------------------------------
+   ПЕРЕНОС СТАРЫХ ДАННЫХ ИЗ БРАУЗЕРА В ОБЛАКО
+   Запускается вручную из настроек. Профили переносятся без паролей:
+   владельцам нужно зарегистрироваться заново, материалы при этом
+   сохранятся и привяжутся по логину.
+   ------------------------------------------------------------------ */
+function cloudLegacy(){
+  let raw=null; try{ raw=localStorage.getItem(LS.DB+'_local_backup'); }catch(e){}
+  if(!raw) return null;
+  try{ const d=JSON.parse(raw); return (d&&Array.isArray(d.users))?d:null; }catch(e){ return null; }
+}
+async function cloudMigrate(old,report){
+  const say=x=>{ if(report) report(x); };
+  const items=(old.videos||[]).map(v=>({kind:'video',d:v})).concat((old.posts||[]).map(p=>({kind:'post',d:p})));
+  say(LANG==='ru'?'Переношу материалы…':'Uploading items…');
+  // Материалы, комментарии и прочее переносятся как есть
+  const chunks=(arr,n)=>{ const o=[]; for(let i=0;i<arr.length;i+=n) o.push(arr.slice(i,i+n)); return o; };
+  for(const part of chunks(items,50)){
+    const rows=part.map(x=>({id:x.d.id,kind:x.kind,author:x.d.author,slug:x.d.slug||'',data:x.d}));
+    const {error}=await CLOUD.client.from('content').upsert(rows);
+    if(error) throw error;
+  }
+  say(LANG==='ru'?'Переношу комментарии…':'Uploading comments…');
+  for(const part of chunks(old.comments||[],200)){
+    const rows=part.map(c=>({id:c.id,target_id:c.targetId,author:c.author,data:c}));
+    const {error}=await CLOUD.client.from('comments').upsert(rows);
+    if(error) throw error;
+  }
+  say(LANG==='ru'?'Переношу подписки и просмотры…':'Uploading follows and views…');
+  for(const part of chunks(old.follows||[],400)){
+    const rows=part.map(f=>({from_user:f.from,to_user:f.to,at:f.at||Date.now()}));
+    await CLOUD.client.from('follows').upsert(rows,{onConflict:'from_user,to_user'});
+  }
+  for(const part of chunks(old.views||[],400)){
+    const rows=part.map(v=>({item:v.item,who:v.who,at:v.at||Date.now()}));
+    await CLOUD.client.from('views').upsert(rows,{onConflict:'item,who'});
+  }
+  say(LANG==='ru'?'Переношу файлы…':'Uploading files…');
+  // Медиа: всё, что лежало в браузере, уезжает в хранилище
+  const keys=[];
+  items.forEach(x=>['fileKey','coverKey','trailerKey'].forEach(k=>{ if(x.d[k]) keys.push(x.d[k]); }));
+  (old.posts||[]).forEach(p=>(p.photos||[]).forEach(ph=>{ if(ph.key) keys.push(ph.key); }));
+  (old.users||[]).forEach(u=>{ if(u.avatarKey) keys.push(u.avatarKey); });
+  let n=0;
+  for(const k of keys){
+    const blob=await mGet(k);
+    if(!blob) continue;
+    n++; say((LANG==='ru'?'Файлы: ':'Files: ')+n+' / '+keys.length);
+    try{ await CLOUD.client.storage.from(CLOUD.BUCKET).upload(k,blob,{upsert:true,contentType:blob.type||'application/octet-stream'}); }
+    catch(e){ console.warn('[cloud] file '+k,e); }
+  }
+  say(LANG==='ru'?'Готово.':'Done.');
+}
+
+
+/* ==================================================================
    СЕКРЕТНЫЕ КЛЮЧИ. Меняются только здесь.
    В коде лежат контрольные суммы — самих ключей в файле нет.
    Новый ключ: в консоли выполнить keyHash('ВАШ-КЛЮЧ') и вставить число.
@@ -688,6 +989,9 @@ const t=k=>(I18N[LANG]&&I18N[LANG][k])||I18N.ru[k]||k;
 const REGIONS=['EU','AS','NA','SA','AF','OC','AN'];
 const CATEGORIES=['none','music','games','edu','tech','news','vlog','sport','art'];
 function emptyDB(){
+  // В облачном режиме встроенной учётной записи нет: администратор назначается в базе
+  if(CLOUD.on) return { version:DB_VERSION, createdAt:Date.now(), users:[],
+    posts:[], videos:[], comments:[], tickets:[], logs:[], views:[], bans:[], restrictions:[], follows:[], premchat:[] };
   return { version:DB_VERSION, createdAt:Date.now(),
     users:[{ id:'u_admin', username:'admin', password:'admin123', name:'Администрация', initials:'A',
       color:'#e5e5e5', avatarKey:'', bio:'', region:'EU', role:'admin', isVerified:true, showStaff:true,
@@ -718,12 +1022,15 @@ function loadDB(){
   db.videos.concat(db.posts).forEach(x=>{ if(!x.slug){
     const A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
     let o=''; for(let i=0;i<13;i++) o+=A[Math.floor(Math.random()*A.length)]; x.slug=o; } });
-  if(!db.users.some(u=>u.role==='admin')) db.users.push(emptyDB().users[0]);
+  if(!CLOUD.on && !db.users.some(u=>u.role==='admin')) db.users.push(emptyDB().users[0]);
   db.version=DB_VERSION;
   return db;
 }
 let DB=loadDB();
-function saveDB(){ try{ localStorage.setItem(LS.DB,JSON.stringify(DB)); }catch(e){ toast('LocalStorage: '+e.name); } }
+function saveDB(){
+  try{ localStorage.setItem(LS.DB,JSON.stringify(DB)); }catch(e){ toast('LocalStorage: '+e.name); }
+  cloudPush();                       // изменения уезжают в общую базу
+}
 function loadSession(){ try{ return JSON.parse(localStorage.getItem(LS.SESSION)||'null'); }catch(e){ return null; } }
 let SESSION=loadSession();
 function loadSet(){
@@ -754,19 +1061,40 @@ function mOpen(){
     rq.onerror=()=>rej(rq.error);
   });
 }
-const mPut=(k,b)=>mOpen().then(d=>new Promise((res,rej)=>{
+const mPutLocal=(k,b)=>mOpen().then(d=>new Promise((res,rej)=>{
   const tx=d.transaction(MEDIA.store,'readwrite'); tx.objectStore(MEDIA.store).put(b,k);
   tx.oncomplete=()=>res(true); tx.onerror=()=>rej(tx.error); tx.onabort=()=>rej(tx.error); }));
 const mGet=k=>mOpen().then(d=>new Promise((res,rej)=>{
   const rq=d.transaction(MEDIA.store,'readonly').objectStore(MEDIA.store).get(k);
   rq.onsuccess=()=>res(rq.result||null); rq.onerror=()=>rej(rq.error); })).catch(()=>null);
-const mDel=k=>mOpen().then(d=>new Promise(res=>{
+const mDelLocal=k=>mOpen().then(d=>new Promise(res=>{
   const tx=d.transaction(MEDIA.store,'readwrite'); tx.objectStore(MEDIA.store).delete(k);
   tx.oncomplete=()=>res(1); tx.onerror=()=>res(0); })).catch(()=>0);
 const URLC={};
+/* Файл уходит в общее хранилище, а копия остаётся в браузере — для мгновенного показа автору */
+function mPut(k,b){
+  if(!CLOUD.on) return mPutLocal(k,b);
+  return CLOUD.client.storage.from(CLOUD.BUCKET)
+    .upload(k,b,{upsert:true,contentType:b.type||'application/octet-stream'})
+    .then(r=>{ if(r.error) throw r.error;
+      mPutLocal(k,b).catch(()=>{});
+      return true; });
+}
+function mDel(k){
+  if(CLOUD.on){ try{ CLOUD.client.storage.from(CLOUD.BUCKET).remove([k]); }catch(e){} }
+  return mDelLocal(k);
+}
 function mURL(k){
   if(!k) return Promise.resolve(null);
   if(URLC[k]) return Promise.resolve(URLC[k]);
+  if(CLOUD.on){
+    // Общий адрес файла виден всем посетителям, а не только его загрузившему
+    try{
+      const r=CLOUD.client.storage.from(CLOUD.BUCKET).getPublicUrl(k);
+      const u=r&&r.data&&r.data.publicUrl;
+      if(u){ URLC[k]=u; return Promise.resolve(u); }
+    }catch(e){}
+  }
   return mGet(k).then(b=>{ if(!b) return null; const u=URL.createObjectURL(b); URLC[k]=u; return u; });
 }
 function fmtBytes(b){
@@ -1252,11 +1580,28 @@ function renderRules(box,rules){
 }
 function bindAuth(){
   const err=$('#lgErr');
-  const doLogin=()=>{
+  const doLogin=async()=>{
     const fail=x=>{ err.textContent=x; err.classList.remove('hidden'); };
     if(Date.now()<loginLock) return fail(t('errAttempts')+' '+Math.ceil((loginLock-Date.now())/1000)+' '+t('seconds'));
     const l=$('#lgLogin').value.trim(),p=$('#lgPass').value;
     if(!l||!p) return fail(t('errEmptyLogin'));
+    if(CLOUD.on){
+      const btn=$('#lgBtn'), was=btn.innerHTML;
+      btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
+      const r=await cloudSignIn(l,p);
+      btn.disabled=false; btn.innerHTML=was;
+      if(!r.ok){ loginTries++;
+        if(loginTries>=5){ loginLock=Date.now()+30000; loginTries=0; } return fail(t('errCreds')); }
+      try{ await cloudPull(); }catch(e){}
+      const prof=DB.users.find(x=>x.authId===r.user.id);
+      if(!prof){ await cloudSignOut(); return fail(t('errCreds')); }
+      if(banInfo(prof)){ await cloudSignOut(); return fail(banMessage(prof)); }
+      loginTries=0;
+      SESSION={username:prof.username,at:Date.now(),authId:r.user.id};
+      localStorage.setItem(LS.SESSION,JSON.stringify(SESSION));
+      sessionStorage.removeItem('orbit_guest');
+      cloudWatch(); go('home'); return;
+    }
     const u=DB.users.find(x=>x.username.toLowerCase()===l.toLowerCase());
     if(!u||u.password!==p){ loginTries++;
       if(loginTries>=5){ loginLock=Date.now()+30000; loginTries=0; } return fail(t('errCreds')); }
@@ -1284,15 +1629,35 @@ function bindAuth(){
   };
   ['rgName','rgLogin','rgPass','rgPass2'].forEach(id=>{ $('#'+id).oninput=validate; });
   $('#rgTerms').onchange=validate;
-  const doReg=()=>{
+  const doReg=async()=>{
     const e2=$('#rgErr');
     if(!validate()){ if(!$('#rgTerms').checked){ e2.textContent=t('errTerms'); e2.classList.remove('hidden'); } return; }
     const lg=$('#rgLogin').value.trim();
+    const pal=['#e5e5e5','#9ec1ff','#a5e3b0','#ffd08a','#f4a9b8','#c4b5fd','#8fd6d6'];
+    const name=$('#rgName').value.trim();
+    if(CLOUD.on){
+      const btn=$('#rgBtn'), was=btn.innerHTML;
+      btn.disabled=true; btn.innerHTML='<span class="spinner"></span>';
+      try{ await cloudPull(); }catch(e){}
+      if(DB.users.some(u=>u.username.toLowerCase()===lg.toLowerCase())){
+        btn.disabled=false; btn.innerHTML=was;
+        e2.textContent=t('errTaken'); e2.classList.remove('hidden'); validate(); return; }
+      const prof={ id:uid('u'),username:lg,name,initials:initialsOf(name),
+        color:pal[DB.users.length%pal.length],avatarKey:'',bio:'',region:$('#rgRegion').value,
+        role:'user',isVerified:false,showStaff:false,banned:false,bannedUntil:0,banReason:'',
+        following:[],bookmarks:[],notifications:[],createdAt:Date.now() };
+      const r=await cloudSignUp(lg,$('#rgPass').value,prof);
+      btn.disabled=false; btn.innerHTML=was;
+      if(!r.ok){ e2.textContent=r.why||t('errTaken'); e2.classList.remove('hidden'); return; }
+      try{ await cloudPull(); }catch(e){}
+      SESSION={username:lg,at:Date.now(),authId:r.id};
+      localStorage.setItem(LS.SESSION,JSON.stringify(SESSION));
+      sessionStorage.removeItem('orbit_guest');
+      cloudWatch(); go('home'); toast(t('regOk')); return;
+    }
     DB=loadDB();
     if(DB.users.some(u=>u.username.toLowerCase()===lg.toLowerCase())){
       e2.textContent=t('errTaken'); e2.classList.remove('hidden'); validate(); return; }
-    const pal=['#e5e5e5','#9ec1ff','#a5e3b0','#ffd08a','#f4a9b8','#c4b5fd','#8fd6d6'];
-    const name=$('#rgName').value.trim();
     DB.users.push({ id:uid('u'),username:lg,password:$('#rgPass').value,name,initials:initialsOf(name),
       color:pal[DB.users.length%pal.length],avatarKey:'',bio:'',region:$('#rgRegion').value,
       role:'user',isVerified:false,showStaff:false,banned:false,bannedUntil:0,banReason:'',
@@ -1395,7 +1760,8 @@ function bindShell(){
   if(c) c.onclick=()=>{ SET.compact=!SET.compact; saveSet(); $('#sidebar').classList.toggle('mini',SET.compact); };
   const b=$('#burger'); if(b) b.onclick=()=>$('#sidebar').classList.toggle('open');
   const lo=$('#logoutBtn');
-  if(lo) lo.onclick=()=> confirmBox(t('confirmLogoutT'),t('confirmLogoutB'),t('logout'),()=>{
+  if(lo) lo.onclick=()=> confirmBox(t('confirmLogoutT'),t('confirmLogoutB'),t('logout'),async()=>{
+    if(CLOUD.on) await cloudSignOut();
     SESSION=null; localStorage.removeItem(LS.SESSION); localStorage.removeItem(LS.ADMIN);
     sessionStorage.removeItem('orbit_guest'); confirmedUntil=0; go('auth');
   },true);
@@ -2995,13 +3361,57 @@ function settingsPage(){
     '<div class="mono" style="text-align:center;color:var(--dim);font-size:12px;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">'+
       esc(t('version'))+' '+APP_VERSION+'</div>'+
    '</div>'+
+   cloudCard()+
    (u?'<div class="card" style="padding:20px;max-width:640px;margin-top:20px;border-color:#3a2226">'+
      '<div style="font-weight:700;color:#f2858a">'+esc(t('dangerZone'))+'</div>'+
      '<div style="color:var(--muted);font-size:13.5px;margin-top:6px">'+esc(t('delAccWarn'))+'</div>'+
      '<button class="btn btn-danger" id="delAcc" style="margin-top:14px">'+esc(t('delAccount'))+'</button></div>':'');
 }
+/* Состояние общей базы и перенос данных, оставшихся в браузере */
+function cloudCard(){
+  const ru=LANG==='ru';
+  const legacy=cloudLegacy();
+  const state = CLOUD.on
+    ? '<span class="badge badge-ok">'+(ru?'Общая база подключена':'Cloud connected')+'</span>'
+    : '<span class="badge badge-warn">'+(ru?'Только этот браузер':'This browser only')+'</span>';
+  return '<div class="card" style="padding:20px;max-width:640px;margin-top:20px">'+
+   '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'+
+    '<div style="font-weight:700">'+(ru?'Хранение данных':'Data storage')+'</div>'+state+'</div>'+
+   '<div class="hint" style="margin-top:8px">'+
+    (CLOUD.on ? (ru?'Публикации, каналы и файлы видны всем посетителям сайта.'
+                  :'Publications, channels and files are visible to every visitor.')
+              : (ru?'Заполните Project URL и anon key в начале файла, чтобы материалы стали общими.'
+                  :'Fill in Project URL and anon key at the top of the file to share content.'))+'</div>'+
+   (CLOUD.on&&legacy?
+     '<hr class="divider" style="margin:16px 0">'+
+     '<div style="font-weight:700;font-size:14px">'+(ru?'Данные из прежней версии':'Data from the earlier version')+'</div>'+
+     '<div class="hint" style="margin-top:6px">'+
+      (ru?'В этом браузере сохранились материалы, снятые до подключения общей базы: '
+          +(legacy.videos||[]).length+' видео, '+(legacy.posts||[]).length+' постов, '
+          +(legacy.comments||[]).length+' комментариев. Их можно перенести. Профили переносятся без паролей — владельцам нужно зарегистрироваться заново, материалы привяжутся по логину.'
+        :'This browser still holds items created before the shared database: '
+          +(legacy.videos||[]).length+' videos, '+(legacy.posts||[]).length+' posts. Profiles move without passwords.')+'</div>'+
+     '<div id="mgState" class="hint hidden" style="margin-top:10px"></div>'+
+     '<button class="btn btn-sm" id="mgGo" style="margin-top:12px">'+(ru?'Перенести в общую базу':'Move to shared database')+'</button>'
+    :'')+
+  '</div>';
+}
 function bindSettings(){
   const u=me();
+  const mg=$('#mgGo');
+  if(mg) mg.onclick=()=>{
+    const old=cloudLegacy(); if(!old) return;
+    const st=$('#mgState'); st.classList.remove('hidden');
+    mg.disabled=true; mg.innerHTML='<span class="spinner"></span>';
+    cloudMigrate(old,x=>{ st.textContent=x; })
+      .then(async()=>{
+        try{ localStorage.removeItem(LS.DB+'_local_backup'); }catch(e){}
+        try{ await cloudPull(); }catch(e){}
+        toast(t('toastSaved')); render();
+      })
+      .catch(e=>{ st.textContent=String(e&&e.message||e); mg.disabled=false;
+        mg.textContent=LANG==='ru'?'Повторить':'Retry'; });
+  };
   const sw=(sel,fn)=>{ const e=$(sel); if(e) e.onclick=()=>{ fn(e); }; };
   sw('#swAuto',e=>{ SET.autoplay=!SET.autoplay; e.classList.toggle('on',SET.autoplay); saveSet(); });
   sw('#swDis',e=>{ SET.showDislikes=!SET.showDislikes; e.classList.toggle('on',SET.showDislikes); saveSet(); });
@@ -3040,7 +3450,18 @@ function openDeleteAccount(u){
   const p=$('#daPass'),n=$('#daName'),g=$('#daGo'),e=$('#daErr');
   const val=()=>{ g.disabled=!(p.value.length>0&&n.value===u.username); };
   p.oninput=val; n.oninput=val;
-  g.onclick=()=>{
+  g.onclick=async()=>{
+    if(CLOUD.on){
+      const chk=await cloudSignIn(u.username,p.value);   // пароль сверяет сама служба входа
+      if(!chk.ok){ e.textContent=t('errCreds'); e.classList.remove('hidden'); return; }
+      deleteAccount(u.username,false);
+      saveDB(); await cloudPushNow();
+      try{ await CLOUD.client.from('profiles').delete().eq('id',u.authId); }catch(err){}
+      await cloudSignOut();
+      SESSION=null; localStorage.removeItem(LS.SESSION); localStorage.removeItem(LS.ADMIN);
+      sessionStorage.removeItem('orbit_guest');
+      closeModal(); go('auth'); toast(t('accDeleted')); return;
+    }
     if(p.value!==u.password){ e.textContent=t('errCreds'); e.classList.remove('hidden'); return; }
     deleteAccount(u.username,false);
     saveDB();
@@ -3178,6 +3599,24 @@ function bindAdminGate(){
     if(Date.now()<admLock) return fail(t('errAttempts')+' '+Math.ceil((admLock-Date.now())/1000)+' '+t('seconds'));
     const l=$('#agLogin').value.trim(),p=$('#agPass').value;
     const u=DB.users.find(x=>x.username.toLowerCase()===l.toLowerCase());
+    if(CLOUD.on){
+      // В общей базе паролей нет — их держит служба входа
+      cloudSignIn(l,p).then(async r=>{
+        if(!r.ok){ admTries++; if(admTries>=5){ admLock=Date.now()+60000; admTries=0; } return fail(t('errCreds')); }
+        try{ await cloudPull(); }catch(e){}
+        const pu=DB.users.find(x=>x.authId===r.user.id);
+        if(!pu) return fail(t('errCreds'));
+        if(banInfo(pu)) return fail(banMessage(pu));
+        if(pu.role!=='admin') return fail(t('errNotAdmin'));
+        admTries=0;
+        localStorage.setItem(LS.ADMIN,JSON.stringify({username:pu.username,at:Date.now()}));
+        SESSION={username:pu.username,at:Date.now(),authId:r.user.id};
+        localStorage.setItem(LS.SESSION,JSON.stringify(SESSION));
+        logAdmin('logLogin','@'+pu.username); saveDB();
+        cloudWatch(); UI.atab='dash'; render();
+      });
+      return;
+    }
     if(!u||u.password!==p){ admTries++; if(admTries>=5){ admLock=Date.now()+60000; admTries=0; } return fail(t('errCreds')); }
     if(banInfo(u)) return fail(banMessage(u));
     if(u.role!=='admin') return fail(t('errNotAdmin'));
@@ -3207,10 +3646,28 @@ function bindAdminGate(){
       keyTries++; if(keyTries>=SECURITY.MASTER_ATTEMPTS){ keyLock=Date.now()+SECURITY.MASTER_LOCK_MS; keyTries=0; }
       return fail(t('errKey'));
     }
-    DB=loadDB();
     const lg=$('#mkLogin').value.trim();
-    if(DB.users.some(u=>u.username.toLowerCase()===lg.toLowerCase())) return fail(t('errTaken'));
     const name=$('#mkName').value.trim();
+    if(CLOUD.on){
+      (async()=>{
+        try{ await cloudPull(); }catch(e){}
+        if(DB.users.some(u=>u.username.toLowerCase()===lg.toLowerCase())) return fail(t('errTaken'));
+        const prof={ id:uid('u'),username:lg,name,initials:initialsOf(name),
+          color:'#e5e5e5',avatarKey:'',bio:'',region:'EU',role:'admin',isVerified:true,showStaff:false,
+          banned:false,bannedUntil:0,banReason:'',following:[],bookmarks:[],notifications:[],createdAt:Date.now() };
+        const r=await cloudSignUp(lg,$('#mkPass').value,prof);
+        if(!r.ok) return fail(r.why||t('errTaken'));
+        try{ await cloudPull(); }catch(e){}
+        logAdmin('logNewAdmin','@'+lg); saveDB();
+        localStorage.setItem(LS.ADMIN,JSON.stringify({username:lg,at:Date.now()}));
+        SESSION={username:lg,at:Date.now(),authId:r.id};
+        localStorage.setItem(LS.SESSION,JSON.stringify(SESSION));
+        keyTries=0; cloudWatch(); UI.atab='dash'; render(); toast(t('adminCreated'));
+      })();
+      return;
+    }
+    DB=loadDB();
+    if(DB.users.some(u=>u.username.toLowerCase()===lg.toLowerCase())) return fail(t('errTaken'));
     DB.users.push({ id:uid('u'),username:lg,password:$('#mkPass').value,name,initials:initialsOf(name),
       color:'#e5e5e5',avatarKey:'',bio:'',region:'EU',role:'admin',isVerified:true,showStaff:false,
       banned:false,bannedUntil:0,banReason:'',following:[],bookmarks:[],notifications:[],createdAt:Date.now() });
@@ -4011,8 +4468,45 @@ function render(){
    ЗАПУСК И СИНХРОНИЗАЦИЯ ВКЛАДОК
    ================================================================== */
 ROUTE=parseHash();
-if(!location.hash && !SESSION && sessionStorage.getItem('orbit_guest')!=='1'){ ROUTE={name:'auth',arg:'',tab:''}; }
-render();
+
+/* Первый запуск: в облачном режиме сначала приходят данные, потом рисуем страницу */
+async function boot(){
+  if(!CLOUD.on){
+    if(!location.hash && !SESSION && sessionStorage.getItem('orbit_guest')!=='1'){ ROUTE={name:'auth',arg:'',tab:''}; }
+    render(); return;
+  }
+  cloudSplash(LANG==='ru'?'Загружаем данные…':'Loading…');
+  try{ await cloudLoadSDK(); }
+  catch(e){ return cloudErr(LANG==='ru'?'Не удалось загрузить библиотеку Supabase':'Could not load the Supabase library',
+    LANG==='ru'?'Проверьте подключение к сети и повторите.':'Check your connection and try again.'); }
+  try{
+    CLOUD.client=window.supabase.createClient(CLOUD.URL,CLOUD.KEY,{auth:{persistSession:true,autoRefreshToken:true}});
+  }catch(e){ return cloudErr(LANG==='ru'?'Неверные настройки подключения':'Invalid connection settings',String(e&&e.message||e)); }
+
+  // Материалы, оставшиеся от версии без общей базы, откладываем — их можно перенести из настроек
+  try{
+    const raw=localStorage.getItem(LS.DB);
+    if(raw && !localStorage.getItem(LS.DB+'_local_backup')){
+      const d=JSON.parse(raw);
+      if(d&&Array.isArray(d.users)&&((d.videos||[]).length||(d.posts||[]).length))
+        localStorage.setItem(LS.DB+'_local_backup',raw);
+    }
+  }catch(e){}
+
+  try{ await cloudPull(); }
+  catch(e){ return cloudErr(LANG==='ru'?'Нет связи с базой данных':'Cannot reach the database',
+    (LANG==='ru'?'Проверьте адрес проекта, ключ и то, что таблицы созданы. Ответ службы: ':'Check the project URL, the key and that the tables exist. Server said: ')+String(e&&e.message||e)); }
+
+  CLOUD.ready=true;
+  await cloudSyncSession();
+  cloudWatch();
+  CLOUD.client.auth.onAuthStateChange((ev)=>{ if(ev==='SIGNED_OUT'){ SESSION=null; localStorage.removeItem(LS.SESSION); } });
+
+  ROUTE=parseHash();
+  if(!location.hash && !SESSION && sessionStorage.getItem('orbit_guest')!=='1'){ ROUTE={name:'auth',arg:'',tab:''}; }
+  render();
+}
+boot();
 /* Изменения из других вкладок этого же браузера подхватываются на лету */
 window.addEventListener('storage',e=>{
   if(e.key!==LS.DB&&e.key!==LS.SESSION) return;
@@ -4021,8 +4515,9 @@ window.addEventListener('storage',e=>{
 });
 setInterval(()=>{
   if($('#modals').innerHTML) return;
+  if(CLOUD.on&&!CLOUD.ready) return;
   const before=unreadCount();
-  DB=loadDB();
+  if(!CLOUD.on) DB=loadDB();      // в облачном режиме данные приходят сами
   const u=me();
   if(SESSION&&(!u||banInfo(u))){ render(); return; }
   if(unreadCount()!==before) render();
